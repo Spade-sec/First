@@ -4,6 +4,7 @@
   "cdp_port": "62000",
   "debug_main": false,
   "debug_frida": false,
-  "selected_preload_scripts": [],
-  "custom_headers": []
+  "selected_preload_scripts": [
+    "bypass_debugger.js"
+  ]
 }

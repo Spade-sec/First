@@ -1,6 +1,6 @@
 """
 First GUI — PySide6 版
-Author: vs-olitus | https://github.com/vs-olitus/First
+Author: Spade-sec | https://github.com/Spade-sec/First
 """
 import asyncio
 import json
@@ -13,9 +13,9 @@ from datetime import datetime
 
 from PySide6.QtCore import (
     Qt, QTimer, QPropertyAnimation, QEasingCurve, Property, QRect,
-    Signal, QPoint,
+    Signal, QPoint, QUrl,
 )
-from PySide6.QtGui import QPainter, QColor, QFont, QIcon
+from PySide6.QtGui import QPainter, QColor, QFont, QIcon, QPixmap, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QFrame, QPushButton, QScrollArea, QTextEdit,
@@ -733,11 +733,25 @@ class App(QMainWindow):
         sb_head.setObjectName("sb_head")
         sb_head.setFixedHeight(76)
         sb_head_lay = QVBoxLayout(sb_head)
+        sb_head_lay.addStretch()
+
+        logo_row = QHBoxLayout()
+        logo_row.setContentsMargins(0, 0, 0, 0)
+        logo_row.setSpacing(6)
+        logo_row.addStretch()
+        _ico_path = os.path.join(_BASE_DIR, "icon.ico")
+        if os.path.exists(_ico_path):
+            _ico_lbl = QLabel()
+            _pix = QPixmap(_ico_path).scaled(20, 20, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            _ico_lbl.setPixmap(_pix)
+            _ico_lbl.setFixedSize(20, 20)
+            logo_row.addWidget(_ico_lbl)
         self._sb_logo = QLabel("First")
         self._sb_logo.setObjectName("sb_logo")
-        self._sb_logo.setAlignment(Qt.AlignCenter)
-        sb_head_lay.addStretch()
-        sb_head_lay.addWidget(self._sb_logo)
+        logo_row.addWidget(self._sb_logo)
+        logo_row.addStretch()
+        sb_head_lay.addLayout(logo_row)
+
         sb_head_lay.addStretch()
         sb_lay.addWidget(sb_head)
 
@@ -784,14 +798,14 @@ class App(QMainWindow):
         sb_author.setAlignment(Qt.AlignCenter)
         sb_author.setFont(QFont(_FN, 8))
         sb_lay.addWidget(sb_author)
-        sb_gh = QLabel("github.com/vs-olitus/First")
+        sb_gh = QLabel("github.com/Spade-sec/First")
         sb_gh.setObjectName("sb_theme")
         sb_gh.setAlignment(Qt.AlignCenter)
         sb_gh.setFont(QFont(_FN, 7))
         sb_gh.setCursor(Qt.PointingHandCursor)
         sb_gh.mousePressEvent = lambda e: (
-            QApplication.clipboard().setText("https://github.com/vs-olitus/First"),
-            self._log_add("info", "[gui] GitHub 链接已复制"))
+            QDesktopServices.openUrl(QUrl("https://github.com/Spade-sec/First")),
+            self._log_add("info", "[gui] 已打开 GitHub 页面"))
         sb_lay.addWidget(sb_gh)
         sb_lay.addSpacing(12)
         self._update_theme_label()
