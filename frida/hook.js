@@ -124,8 +124,19 @@ const winPatchLoadStart = (base, config) => {
             // Scene hijack via SceneOffsets pointer chain
             try {
                 const offsets = config.SceneOffsets;
-                const ptr1 = this.context.rcx.add(56).readPointer().add(offsets[0]).readPointer();
-                const scenePtr = ptr1.add(8).readPointer().add(offsets[1]).readPointer().add(16).readPointer().add(488);
+                const miniappConfigPtr = this.context.rcx
+                    .add(offsets[0])
+                    .readPointer()
+                    .add(offsets[1])
+                    .readPointer();
+                const scenePtr = miniappConfigPtr
+                    .add(offsets[2])
+                    .readPointer()
+                    .add(offsets[3])
+                    .readPointer()
+                    .add(offsets[4])
+                    .readPointer()
+                    .add(offsets[5]);
                 const scene = scenePtr.readInt();
                 send(`[hook] scene: ${scene}`);
                 if (SCENE_WHITELIST.includes(scene)) {
@@ -164,7 +175,7 @@ const parseConfig = () => {
             Version: 18955,
             LoadStartHookOffset: "0x25B52C0",
             CDPFilterHookOffset: "0x30248B0",
-            SceneOffsets: [1408, 1344, 488],
+            SceneOffsets: [56, 1408, 8, 1344, 16, 488],
         };
     }
     return JSON.parse(rawConfig);
