@@ -30,6 +30,7 @@ from src.logger import Logger
 from src.engine import DebugEngine
 from src.navigator import MiniProgramNavigator
 from src.cloud_audit import CloudAuditor
+from src.wxapi_audit import WxApiAuditor
 
 # ══════════════════════════════════════════
 #  配色
@@ -64,6 +65,7 @@ _MENU = [
     ("hook",      "◈", "Hook"),
     ("targets",   "◎", "服务目标"),
     ("cloud",     "☁", "云扫描"),
+    ("wxapi",     "⬢", "WxAPI捕获"),
     ("extract",   "◆", "敏感信息提取"),
     ("vconsole",  "◇", "调试开关"),
     ("logs",      "≡", "运行日志"),
@@ -706,6 +708,12 @@ class App(QMainWindow):
         self._cloud_call_history = {}
         self._cloud_all_items = []
         self._cloud_row_results = {}
+        self._cloud_live_items = []  # 动态捕获完整 call 对象列表
+        self._wxapi_auditor = None
+        self._wxapi_items = []
+        self._wxapi_active = False
+        self._wxapi_poll_timer = None
+        self._wxapi_selected_idx = -1
         self._cancel_ev = None
         self._route_poll_id = None
         self._all_routes = []
@@ -724,6 +732,7 @@ class App(QMainWindow):
         self._sts_q = queue.Queue()
         self._rte_q = queue.Queue()
         self._cld_q = queue.Queue()
+        self._wxapi_q = queue.Queue()
         self._tgt_q = queue.Queue()
         self._nav_route_idx = -1
 
@@ -869,7 +878,7 @@ class App(QMainWindow):
             QDesktopServices.openUrl(QUrl("https://github.com/Spade-sec/First")),
             self._log_add("info", "[gui] 已打开 GitHub 页面"))
         sb_lay.addWidget(sb_gh)
-        sb_ver = QLabel("v1.0.8")
+        sb_ver = QLabel("v1.0.9")
         sb_ver.setObjectName("sb_theme")
         sb_ver.setAlignment(Qt.AlignCenter)
         sb_ver.setFont(_qfn(-2))
@@ -914,6 +923,7 @@ class App(QMainWindow):
         self._build_hook()
         self._build_targets()
         self._build_cloud()
+        self._build_wxapi()
         self._build_extract()
         self._build_vconsole()
         self._build_logs()
@@ -1471,12 +1481,22 @@ class App(QMainWindow):
     def _build_cloud(self):
         page = QWidget()
         lay = QVBoxLayout(page)
-        lay.setContentsMargins(24, 12, 24, 16)
-        lay.setSpacing(10)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        # 内嵌 QStackedWidget: 主视图(0) + 动态捕获视图(1)
+        self._cloud_stack = QStackedWidget()
+        lay.addWidget(self._cloud_stack)
+
+        # ── 主视图 (index 0) ──
+        main_page = QWidget()
+        main_lay = QVBoxLayout(main_page)
+        main_lay.setContentsMargins(24, 12, 24, 16)
+        main_lay.setSpacing(10)
 
         ctrl = QHBoxLayout()
-        self._btn_cloud_toggle = _make_btn("停止捕获", self._cloud_do_toggle)
-        ctrl.addWidget(self._btn_cloud_toggle)
+        self._btn_cloud_live = _make_btn("动态捕获", self._cloud_show_live)
+        ctrl.addWidget(self._btn_cloud_live)
         self._btn_cloud_static = _make_btn("静态扫描", self._cloud_do_static_scan)
         ctrl.addWidget(self._btn_cloud_static)
         self._btn_cloud_clear = _make_btn("清空记录", self._cloud_do_clear)
@@ -1486,7 +1506,7 @@ class App(QMainWindow):
         ctrl.addStretch()
         self._btn_cloud_export = _make_btn("导出报告", self._cloud_do_export)
         ctrl.addWidget(self._btn_cloud_export)
-        lay.addLayout(ctrl)
+        main_lay.addLayout(ctrl)
 
         tc = _make_card()
         tc_lay = QVBoxLayout(tc)
@@ -1529,7 +1549,7 @@ class App(QMainWindow):
         self._cloud_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._cloud_tree.customContextMenuRequested.connect(self._cloud_tree_context_menu)
         tc_lay.addWidget(self._cloud_tree)
-        lay.addWidget(tc, 1)
+        main_lay.addWidget(tc, 1)
 
         call_row = QHBoxLayout()
         call_row.addWidget(QLabel("手动调用"))
@@ -1541,22 +1561,222 @@ class App(QMainWindow):
         call_row.addWidget(self._cloud_data_ent, 1)
         self._btn_cloud_call = _make_btn("调用", self._cloud_do_call)
         call_row.addWidget(self._btn_cloud_call)
-        lay.addLayout(call_row)
+        main_lay.addLayout(call_row)
 
         self._cloud_result = QTextEdit()
         self._cloud_result.setReadOnly(True)
         self._cloud_result.setFixedHeight(120)
         self._cloud_result.setFont(_qfm())
-        lay.addWidget(self._cloud_result)
+        main_lay.addWidget(self._cloud_result)
 
         bot = QHBoxLayout()
         self._cloud_status_lbl = QLabel("捕获: 0 条")
         bot.addWidget(self._cloud_status_lbl)
         bot.addStretch()
-        lay.addLayout(bot)
+        main_lay.addLayout(bot)
+
+        self._cloud_stack.addWidget(main_page)  # index 0: 主视图
+
+        # ── 动态捕获视图 (index 1) ──
+        self._build_cloud_live_page()
 
         self._stack.addWidget(page)
         self._page_map["cloud"] = self._stack.count() - 1
+
+    def _build_cloud_live_page(self):
+        """构建动态捕获子页面 (cloud_stack index 1)"""
+        live_page = QWidget()
+        live_lay = QVBoxLayout(live_page)
+        live_lay.setContentsMargins(24, 12, 24, 16)
+        live_lay.setSpacing(10)
+
+        # 顶部控制栏
+        top_bar = QHBoxLayout()
+        self._btn_cloud_live_back = _make_btn("← 返回", self._cloud_live_back)
+        top_bar.addWidget(self._btn_cloud_live_back)
+        top_bar.addWidget(_make_label("动态捕获", bold=True))
+        self._cloud_live_status_lbl = QLabel("捕获中...")
+        top_bar.addWidget(self._cloud_live_status_lbl)
+        top_bar.addStretch()
+        self._cloud_live_search_ent = _make_entry(width=160)
+        self._cloud_live_search_ent.setPlaceholderText("搜索...")
+        self._cloud_live_search_ent.textChanged.connect(self._cloud_live_filter)
+        top_bar.addWidget(self._cloud_live_search_ent)
+        self._btn_cloud_live_clear = _make_btn("清空", self._cloud_live_clear)
+        top_bar.addWidget(self._btn_cloud_live_clear)
+        live_lay.addLayout(top_bar)
+
+        # 左右分栏
+        splitter = QHBoxLayout()
+
+        # 左侧: 捕获列表
+        left_card = _make_card()
+        left_lay = QVBoxLayout(left_card)
+        left_lay.setContentsMargins(8, 8, 8, 8)
+        left_lay.setSpacing(4)
+        self._cloud_live_tree = QTreeWidget()
+        self._cloud_live_tree.setFont(_qfn())
+        self._cloud_live_tree.header().setFont(_qfn())
+        self._cloud_live_tree.setRootIsDecorated(False)
+        self._cloud_live_tree.setIndentation(0)
+        self._cloud_live_tree.setHeaderLabels(["类型", "名称", "状态", "时间"])
+        lh = self._cloud_live_tree.header()
+        lh.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        lh.setStretchLastSection(False)
+        lh.setSectionResizeMode(0, QHeaderView.Interactive)
+        lh.setSectionResizeMode(1, QHeaderView.Stretch)
+        lh.setSectionResizeMode(2, QHeaderView.Interactive)
+        lh.setSectionResizeMode(3, QHeaderView.Interactive)
+        self._cloud_live_tree.setColumnWidth(0, 70)
+        self._cloud_live_tree.setColumnWidth(2, 50)
+        self._cloud_live_tree.setColumnWidth(3, 70)
+        self._cloud_live_tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._cloud_live_tree.itemClicked.connect(self._cloud_live_select)
+        left_lay.addWidget(self._cloud_live_tree)
+        splitter.addWidget(left_card, 2)
+
+        # 右侧: 详情面板
+        right_card = _make_card()
+        right_lay = QVBoxLayout(right_card)
+        right_lay.setContentsMargins(12, 8, 12, 8)
+        right_lay.setSpacing(6)
+
+        right_lay.addWidget(_make_label("请求参数", bold=True))
+        self._cloud_live_req = QTextEdit()
+        self._cloud_live_req.setReadOnly(True)
+        self._cloud_live_req.setFont(_qfm())
+        self._cloud_live_req.setPlaceholderText("选择左侧记录查看请求参数")
+        right_lay.addWidget(self._cloud_live_req, 1)
+
+        right_lay.addWidget(_make_label("返回结果", bold=True))
+        self._cloud_live_resp = QTextEdit()
+        self._cloud_live_resp.setReadOnly(True)
+        self._cloud_live_resp.setFont(_qfm())
+        self._cloud_live_resp.setPlaceholderText("选择左侧记录查看返回结果")
+        right_lay.addWidget(self._cloud_live_resp, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self._btn_cloud_live_replay = _make_btn("一键重放", self._cloud_live_replay)
+        self._btn_cloud_live_replay.setEnabled(False)
+        btn_row.addWidget(self._btn_cloud_live_replay)
+        right_lay.addLayout(btn_row)
+
+        splitter.addWidget(right_card, 3)
+        live_lay.addLayout(splitter, 1)
+
+        self._cloud_stack.addWidget(live_page)  # index 1: 动态捕获视图
+        self._cloud_live_selected_idx = -1
+
+    # ── WxAPI 捕获 ──
+
+    def _build_wxapi(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(24, 12, 24, 16)
+        lay.setSpacing(10)
+
+        # 顶部控制栏
+        top_bar = QHBoxLayout()
+        top_bar.addWidget(_make_label("WxAPI 捕获", bold=True))
+        self._btn_wxapi_toggle = _make_btn("开启捕获", self._wxapi_toggle)
+        top_bar.addWidget(self._btn_wxapi_toggle)
+        self._wxapi_status_lbl = QLabel("已关闭")
+        top_bar.addWidget(self._wxapi_status_lbl)
+        top_bar.addStretch()
+        # 原生桥接开关（默认关闭）
+        self._wxapi_bridge_cb = QCheckBox("原生桥接")
+        self._wxapi_bridge_cb.setChecked(False)
+        self._wxapi_bridge_cb.setToolTip("捕获 WeixinJSBridge 底层调用（会产生大量噪音）")
+        top_bar.addWidget(self._wxapi_bridge_cb)
+        # wx.request 开关（默认关闭）
+        self._wxapi_request_cb = QCheckBox("wx.request")
+        self._wxapi_request_cb.setChecked(False)
+        self._wxapi_request_cb.setToolTip("捕获 wx.request 网络请求（数量较多）")
+        top_bar.addWidget(self._wxapi_request_cb)
+        # wx.storage 开关（默认关闭）
+        self._wxapi_storage_cb = QCheckBox("缓存")
+        self._wxapi_storage_cb.setChecked(False)
+        self._wxapi_storage_cb.setToolTip("捕获 wx.setStorage/getStorage 等缓存操作")
+        top_bar.addWidget(self._wxapi_storage_cb)
+        self._wxapi_search_ent = _make_entry(width=160)
+        self._wxapi_search_ent.setPlaceholderText("搜索...")
+        self._wxapi_search_ent.textChanged.connect(self._wxapi_filter)
+        top_bar.addWidget(self._wxapi_search_ent)
+        self._btn_wxapi_clear = _make_btn("清空", self._wxapi_clear)
+        top_bar.addWidget(self._btn_wxapi_clear)
+        lay.addLayout(top_bar)
+
+        # 左右分栏
+        splitter = QHBoxLayout()
+
+        # 左侧: 捕获列表
+        left_card = _make_card()
+        left_lay = QVBoxLayout(left_card)
+        left_lay.setContentsMargins(8, 8, 8, 8)
+        left_lay.setSpacing(4)
+        self._wxapi_tree = QTreeWidget()
+        self._wxapi_tree.setFont(_qfn())
+        self._wxapi_tree.header().setFont(_qfn())
+        self._wxapi_tree.setRootIsDecorated(False)
+        self._wxapi_tree.setIndentation(0)
+        self._wxapi_tree.setHeaderLabels(["类型", "名称", "状态", "时间"])
+        wh = self._wxapi_tree.header()
+        wh.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        wh.setStretchLastSection(False)
+        wh.setSectionResizeMode(0, QHeaderView.Interactive)
+        wh.setSectionResizeMode(1, QHeaderView.Stretch)
+        wh.setSectionResizeMode(2, QHeaderView.Interactive)
+        wh.setSectionResizeMode(3, QHeaderView.Interactive)
+        self._wxapi_tree.setColumnWidth(0, 90)
+        self._wxapi_tree.setColumnWidth(2, 60)
+        self._wxapi_tree.setColumnWidth(3, 80)
+        self._wxapi_tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._wxapi_tree.itemClicked.connect(self._wxapi_select)
+        left_lay.addWidget(self._wxapi_tree)
+        splitter.addWidget(left_card, 2)
+
+        # 右侧: 详情面板
+        right_card = _make_card()
+        right_lay = QVBoxLayout(right_card)
+        right_lay.setContentsMargins(12, 8, 12, 8)
+        right_lay.setSpacing(6)
+
+        # 类型 + 名称标题
+        self._wxapi_detail_title = _make_label("", bold=True)
+        self._wxapi_detail_title.setWordWrap(True)
+        right_lay.addWidget(self._wxapi_detail_title)
+
+        right_lay.addWidget(_make_label("请求参数", bold=False))
+        self._wxapi_req = QTextEdit()
+        self._wxapi_req.setReadOnly(True)
+        self._wxapi_req.setFont(_qfm())
+        self._wxapi_req.setPlaceholderText("选择左侧记录查看请求参数")
+        self._wxapi_req.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+        right_lay.addWidget(self._wxapi_req, 1)
+
+        right_lay.addWidget(_make_label("返回结果", bold=False))
+        self._wxapi_resp = QTextEdit()
+        self._wxapi_resp.setReadOnly(True)
+        self._wxapi_resp.setFont(_qfm())
+        self._wxapi_resp.setPlaceholderText("选择左侧记录查看返回结果")
+        self._wxapi_resp.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+        right_lay.addWidget(self._wxapi_resp, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self._btn_wxapi_replay = _make_btn("一键重放", self._wxapi_replay)
+        self._btn_wxapi_replay.setEnabled(False)
+        btn_row.addWidget(self._btn_wxapi_replay)
+        right_lay.addLayout(btn_row)
+
+        splitter.addWidget(right_card, 3)
+        lay.addLayout(splitter, 1)
+
+        self._stack.addWidget(page)
+        self._page_map["wxapi"] = self._stack.count() - 1
 
     # ── 敏感信息提取 ──
 
@@ -3219,6 +3439,11 @@ class App(QMainWindow):
             if self._cloud_scan_poll_timer:
                 self._cloud_scan_poll_timer.stop()
                 self._cloud_scan_poll_timer = None
+        if self._wxapi_active:
+            self._wxapi_active = False
+            if self._wxapi_poll_timer:
+                self._wxapi_poll_timer.stop()
+                self._wxapi_poll_timer = None
         if self._cancel_ev:
             self._cancel_ev.set()
         if self._engine and self._loop and self._loop.is_running():
@@ -3326,6 +3551,7 @@ class App(QMainWindow):
         if not self._cloud_scan_active and self._auditor:
             self._cloud_start_scan()
             self._log_add("info", "[云扫描] 小程序连接后自动恢复捕获")
+        # 自动启动 WxAPI 捕获（不自动启动，用户手动开启）
 
     def _delayed_fetch_app_info(self, gen):
         """延迟调用，只有最后一次触发的 gen 匹配才执行。"""
@@ -3715,19 +3941,120 @@ class App(QMainWindow):
         return True
 
     def _cloud_do_toggle(self):
+        """兼容：现在改为切换到动态捕获页面"""
+        self._cloud_show_live()
+
+    def _cloud_show_live(self):
+        """切换到动态捕获子页面"""
+        self._cloud_stack.setCurrentIndex(1)
+        # 确保捕获已启动
+        if not self._cloud_scan_active:
+            self._cloud_start_scan()
+        self._cloud_live_update_status()
+
+    def _cloud_live_back(self):
+        """返回主视图"""
+        self._cloud_stack.setCurrentIndex(0)
+
+    def _cloud_live_select(self, item):
+        """点击动态捕获列表项，显示详情"""
+        idx = self._cloud_live_tree.indexOfTopLevelItem(item)
+        if idx < 0 or idx >= len(self._cloud_live_items):
+            return
+        self._cloud_live_selected_idx = idx
+        call = self._cloud_live_items[idx]
+        # 显示请求参数
+        req_data = call.get("data", {})
+        self._cloud_live_req.setPlainText(
+            json.dumps(req_data, ensure_ascii=False, indent=2, default=str))
+        # 显示返回结果
+        c = _TH[self._tn]
+        status = call.get("status", "")
+        if call.get("result") is not None:
+            resp_text = json.dumps(call["result"], ensure_ascii=False, indent=2, default=str)
+            self._cloud_live_resp.setHtml(
+                f'<span style="color:{c["success"]}">{resp_text}</span>')
+        elif call.get("error") is not None:
+            err_text = json.dumps(call["error"], ensure_ascii=False, indent=2, default=str)
+            self._cloud_live_resp.setHtml(
+                f'<span style="color:{c["error"]}">{err_text}</span>')
+        else:
+            self._cloud_live_resp.setPlainText(f"状态: {status} (无返回数据)")
+        self._btn_cloud_live_replay.setEnabled(True)
+
+    def _cloud_live_replay(self):
+        """一键重放选中的云函数调用"""
+        idx = self._cloud_live_selected_idx
+        if idx < 0 or idx >= len(self._cloud_live_items):
+            return
         if not self._cloud_ensure_auditor():
             return
+        call = self._cloud_live_items[idx]
+        name = call.get("name", "")
+        data = call.get("data", {})
+        if not name:
+            return
+        self._btn_cloud_live_replay.setEnabled(False)
+        self._cloud_live_resp.setPlainText(f"正在重放 {name} ...")
+        asyncio.run_coroutine_threadsafe(
+            self._acloud_live_replay(name, data), self._loop)
+
+    async def _acloud_live_replay(self, name, data):
+        try:
+            res = await self._auditor.call_function(name, data)
+            self._cld_q.put(("live_replay_result", name, res))
+        except Exception as e:
+            self._cld_q.put(("live_replay_result", name,
+                             {"ok": False, "status": "fail", "error": str(e)}))
+
+    def _cloud_live_clear(self):
+        """清空动态捕获列表"""
+        self._cloud_live_items.clear()
+        self._cloud_live_tree.clear()
+        self._cloud_live_req.clear()
+        self._cloud_live_resp.clear()
+        self._btn_cloud_live_replay.setEnabled(False)
+        self._cloud_live_selected_idx = -1
+        self._cloud_live_update_status()
+
+    def _cloud_live_filter(self):
+        """动态捕获列表搜索过滤"""
+        kw = self._cloud_live_search_ent.text().strip().lower()
+        self._cloud_live_tree.clear()
+        _type_cn = {"function": "云函数", "storage": "存储", "container": "容器",
+                    "wx.auth": "认证", "wx.request": "请求", "wx.pay": "支付",
+                    "wx.storage": "缓存", "wx.share": "分享", "wx.location": "位置",
+                    "wx.device": "设备", "wx.nav": "导航", "wx.media": "媒体",
+                    "wx.clipboard": "剪贴板", "wx.bridge": "原生桥接"}
+        for call in self._cloud_live_items:
+            ctype = call.get("type", "function")
+            type_label = _type_cn.get(ctype, ctype)
+            if ctype.startswith("db"):
+                type_label = "数据库"
+            name = call.get("name", "")
+            status = call.get("status", "")
+            ts = call.get("timestamp", "")
+            if kw and kw not in type_label.lower() and kw not in name.lower():
+                continue
+            tree_item = QTreeWidgetItem([type_label, name, status, str(ts)])
+            self._cloud_live_tree.addTopLevelItem(tree_item)
+
+    def _cloud_live_update_status(self):
+        count = len(self._cloud_live_items)
         if self._cloud_scan_active:
-            self._cloud_stop_scan()
+            self._cloud_live_status_lbl.setText(f"捕获中... {count} 条")
+            c = _TH[self._tn]
+            self._cloud_live_status_lbl.setStyleSheet(f"color: {c['success']};")
         else:
-            self._cloud_start_scan()
+            self._cloud_live_status_lbl.setText(f"已停止 ({count} 条)")
+            c = _TH[self._tn]
+            self._cloud_live_status_lbl.setStyleSheet(f"color: {c['text3']};")
 
     def _cloud_start_scan(self):
         if not self._cloud_ensure_auditor():
             return
         self._cloud_scan_active = True
         c = _TH[self._tn]
-        self._btn_cloud_toggle.setText("停止捕获")
         self._cloud_scan_lbl.setText("捕获中...")
         self._cloud_scan_lbl.setStyleSheet(f"color: {c['success']};")
         self._log_add("info", "[云扫描] 全局捕获已启动")
@@ -3743,7 +4070,6 @@ class App(QMainWindow):
     def _cloud_stop_scan(self):
         self._cloud_scan_active = False
         c = _TH[self._tn]
-        self._btn_cloud_toggle.setText("开启捕获")
         self._cloud_scan_lbl.setText("已停止")
         self._cloud_scan_lbl.setStyleSheet(f"color: {c['text3']};")
         if self._cloud_scan_poll_timer:
@@ -3835,6 +4161,209 @@ class App(QMainWindow):
             self._log_add("error", f"[云扫描] 导出失败: {e}")
 
     # ──────────────────────────────────
+    #  WxAPI 捕获逻辑
+    # ──────────────────────────────────
+
+    def _wxapi_ensure(self):
+        if not self._engine or not self._loop or not self._loop.is_running():
+            self._log_add("error", "[WxAPI] 请先启动调试")
+            return False
+        if not self._wxapi_auditor:
+            self._wxapi_auditor = WxApiAuditor(self._engine)
+        return True
+
+    def _wxapi_toggle(self):
+        if self._wxapi_active:
+            self._wxapi_stop()
+            self._btn_wxapi_toggle.setText("开启捕获")
+            c = _TH[self._tn]
+            self._wxapi_status_lbl.setText("已关闭")
+            self._wxapi_status_lbl.setStyleSheet(f"color: {c['text3']};")
+        else:
+            self._wxapi_start()
+            self._btn_wxapi_toggle.setText("停止捕获")
+
+    def _wxapi_start(self):
+        if not self._wxapi_ensure():
+            return
+        if self._wxapi_active:
+            return
+        self._wxapi_active = True
+        c = _TH[self._tn]
+        self._wxapi_status_lbl.setText("捕获中...")
+        self._wxapi_status_lbl.setStyleSheet(f"color: {c['success']};")
+        self._log_add("info", "[WxAPI] 捕获已启动")
+        asyncio.run_coroutine_threadsafe(self._awxapi_start(), self._loop)
+        self._wxapi_poll()
+
+    async def _awxapi_start(self):
+        try:
+            await self._wxapi_auditor.start()
+        except Exception as e:
+            self._log_q.put(("error", f"[WxAPI] Hook 启动异常: {e}"))
+
+    def _wxapi_stop(self):
+        self._wxapi_active = False
+        if self._wxapi_poll_timer:
+            self._wxapi_poll_timer.stop()
+            self._wxapi_poll_timer = None
+        if self._wxapi_auditor and self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._wxapi_auditor.stop(), self._loop)
+
+    def _wxapi_poll(self):
+        if not self._wxapi_active or not self._wxapi_auditor:
+            return
+        if self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._awxapi_poll(), self._loop)
+        self._wxapi_poll_timer = QTimer()
+        self._wxapi_poll_timer.setSingleShot(True)
+        self._wxapi_poll_timer.timeout.connect(self._wxapi_poll)
+        self._wxapi_poll_timer.start(2000)
+
+    async def _awxapi_poll(self):
+        try:
+            new_calls = await self._wxapi_auditor.poll()
+            if new_calls:
+                self._wxapi_q.put(("new_calls", new_calls))
+        except Exception:
+            pass
+
+    def _wxapi_select(self, item):
+        idx = self._wxapi_tree.indexOfTopLevelItem(item)
+        if idx < 0 or idx >= len(self._wxapi_items):
+            return
+        self._wxapi_selected_idx = idx
+        call = self._wxapi_items[idx]
+        # 显示类型 + 名称标题
+        ctype = call.get("type", "wx.api")
+        name = call.get("name", "")
+        self._wxapi_detail_title.setText(f"[{ctype}] {name}")
+        # 请求参数 - 使用 setPlainText 确保可复制
+        req_data = call.get("data", {})
+        self._wxapi_req.setPlainText(
+            json.dumps(req_data, ensure_ascii=False, indent=2, default=str))
+        # 返回结果
+        if call.get("result") is not None:
+            resp_text = json.dumps(call["result"], ensure_ascii=False, indent=2, default=str)
+            self._wxapi_resp.setPlainText(resp_text)
+        elif call.get("error") is not None:
+            err_text = json.dumps(call["error"], ensure_ascii=False, indent=2, default=str)
+            self._wxapi_resp.setPlainText(err_text)
+        else:
+            self._wxapi_resp.setPlainText(f"状态: {call.get('status', '')} (无返回数据)")
+        self._btn_wxapi_replay.setEnabled(True)
+
+    def _wxapi_replay(self):
+        idx = self._wxapi_selected_idx
+        if idx < 0 or idx >= len(self._wxapi_items):
+            return
+        if not self._wxapi_ensure():
+            return
+        call = self._wxapi_items[idx]
+        # 从 name 中提取原始 API 名称
+        api_name = call.get("name", "")
+        # wx.request 的 name 格式是 "GET https://..." 需要用 "request"
+        if call.get("type") == "wx.request":
+            api_name = "request"
+        data = call.get("data", {})
+        self._btn_wxapi_replay.setEnabled(False)
+        self._wxapi_resp.setPlainText(f"正在重放 {api_name} ...")
+        asyncio.run_coroutine_threadsafe(
+            self._awxapi_replay(api_name, data), self._loop)
+
+    async def _awxapi_replay(self, api_name, data):
+        try:
+            res = await self._wxapi_auditor.replay(api_name, data)
+            self._wxapi_q.put(("replay_result", api_name, res))
+        except Exception as e:
+            self._wxapi_q.put(("replay_result", api_name,
+                               {"ok": False, "status": "fail", "error": str(e)}))
+
+    def _wxapi_clear(self):
+        self._wxapi_items.clear()
+        self._wxapi_tree.clear()
+        self._wxapi_req.clear()
+        self._wxapi_resp.clear()
+        self._btn_wxapi_replay.setEnabled(False)
+        self._wxapi_selected_idx = -1
+        self._wxapi_status_lbl.setText(f"捕获中... 0 条" if self._wxapi_active else "已停止")
+        if self._wxapi_auditor and self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._wxapi_auditor.clear(), self._loop)
+
+    def _wxapi_filter(self):
+        kw = self._wxapi_search_ent.text().strip().lower()
+        self._wxapi_tree.clear()
+        _type_cn = {"wx.auth": "认证", "wx.request": "请求", "wx.pay": "支付",
+                    "wx.storage": "缓存", "wx.share": "分享", "wx.location": "位置",
+                    "wx.device": "设备", "wx.nav": "导航", "wx.media": "媒体",
+                    "wx.clipboard": "剪贴板"}
+        for call in self._wxapi_items:
+            ctype = call.get("type", "wx.api")
+            type_label = _type_cn.get(ctype, ctype)
+            name = call.get("name", "")
+            status = call.get("status", "")
+            ts = call.get("timestamp", "")
+            if kw and kw not in type_label.lower() and kw not in name.lower():
+                continue
+            tree_item = QTreeWidgetItem([type_label, name, status, str(ts)])
+            self._wxapi_tree.addTopLevelItem(tree_item)
+
+    def _handle_wxapi(self, item):
+        kind = item[0]
+        c = _TH[self._tn]
+        _type_cn = {"wx.auth": "认证", "wx.request": "请求", "wx.pay": "支付",
+                    "wx.storage": "缓存", "wx.share": "分享", "wx.location": "位置",
+                    "wx.device": "设备", "wx.nav": "导航", "wx.media": "媒体",
+                    "wx.clipboard": "剪贴板", "wx.bridge": "原生桥接"}
+        if kind == "new_calls":
+            calls = item[1]
+            if calls:
+                kw = self._wxapi_search_ent.text().strip().lower()
+                show_bridge = self._wxapi_bridge_cb.isChecked()
+                show_request = self._wxapi_request_cb.isChecked()
+                show_storage = self._wxapi_storage_cb.isChecked()
+                for call in calls:
+                    ctype = call.get("type", "wx.api")
+                    # 原生桥接开关关闭时跳过 bridge 类型
+                    if ctype == "wx.bridge" and not show_bridge:
+                        continue
+                    # wx.request 开关关闭时跳过
+                    if ctype == "wx.request" and not show_request:
+                        continue
+                    # wx.storage 开关关闭时跳过
+                    if ctype == "wx.storage" and not show_storage:
+                        continue
+                    self._wxapi_items.append(call)
+                    type_label = _type_cn.get(ctype, ctype)
+                    name = call.get("name", "")
+                    status = call.get("status", "")
+                    ts = call.get("timestamp", "")
+                    if kw and kw not in type_label.lower() and kw not in name.lower():
+                        continue
+                    tree_item = QTreeWidgetItem([type_label, name, status, str(ts)])
+                    self._wxapi_tree.addTopLevelItem(tree_item)
+                self._wxapi_tree.scrollToBottom()
+                count = len(self._wxapi_items)
+                self._wxapi_status_lbl.setText(f"捕获中... {count} 条")
+                self._wxapi_status_lbl.setStyleSheet(f"color: {c['success']};")
+        elif kind == "replay_result":
+            _, name, res = item
+            self._btn_wxapi_replay.setEnabled(True)
+            status = res.get("status", "unknown")
+            if status == "success":
+                detail = json.dumps(res.get("result", {}), ensure_ascii=False, indent=2, default=str)
+                self._wxapi_resp.setHtml(
+                    f'<span style="color:{c["success"]}">重放成功:\n{detail}</span>')
+            elif status == "fail":
+                err = res.get("error", "") or res.get("reason", "未知错误")
+                self._wxapi_resp.setHtml(
+                    f'<span style="color:{c["error"]}">重放失败: {err}</span>')
+            else:
+                detail = json.dumps(res, ensure_ascii=False, indent=2, default=str)
+                self._wxapi_resp.setHtml(
+                    f'<span style="color:{c["warning"]}">重放结果:\n{detail}</span>')
+
+    # ──────────────────────────────────
     #  轮询
     # ──────────────────────────────────
 
@@ -3882,6 +4411,12 @@ class App(QMainWindow):
             except queue.Empty:
                 break
             self._handle_ext(item)
+        for _ in range(50):
+            try:
+                item = self._wxapi_q.get_nowait()
+            except queue.Empty:
+                break
+            self._handle_wxapi(item)
 
     def _apply_sts(self, sts):
         c = _TH[self._tn]
@@ -4009,11 +4544,16 @@ class App(QMainWindow):
     def _handle_cld(self, item):
         kind = item[0]
         c = _TH[self._tn]
-        _type_cn = {"function": "云函数", "storage": "存储", "container": "容器"}
+        _type_cn = {"function": "云函数", "storage": "存储", "container": "容器",
+                    "wx.auth": "认证", "wx.request": "请求", "wx.pay": "支付",
+                    "wx.storage": "缓存", "wx.share": "分享", "wx.location": "位置",
+                    "wx.device": "设备", "wx.nav": "导航", "wx.media": "媒体",
+                    "wx.clipboard": "剪贴板", "wx.bridge": "原生桥接"}
         if kind == "new_calls":
             calls = item[1]
             if calls:
                 kw = self._cloud_search_ent.text().strip().lower()
+                live_kw = self._cloud_live_search_ent.text().strip().lower()
                 for call in calls:
                     data_str = json.dumps(call.get("data", {}), ensure_ascii=False)
                     if len(data_str) > 80:
@@ -4027,20 +4567,29 @@ class App(QMainWindow):
                             call.get("name", ""), data_str,
                             status, call.get("timestamp", ""))
                     self._cloud_all_items.append(vals)
-                    if kw and not any(kw in str(v).lower() for v in vals):
-                        continue
-                    tree_item = QTreeWidgetItem([str(v) for v in vals])
-                    self._cloud_tree.addTopLevelItem(tree_item)
-                    result_data = call.get("result") or call.get("error")
-                    if result_data is not None:
-                        self._cloud_row_results[id(tree_item)] = {
-                            "status": status,
-                            "result": call.get("result"),
-                            "error": call.get("error"),
-                            "data": call.get("data"),
-                        }
+                    if not (kw and not any(kw in str(v).lower() for v in vals)):
+                        tree_item = QTreeWidgetItem([str(v) for v in vals])
+                        self._cloud_tree.addTopLevelItem(tree_item)
+                        result_data = call.get("result") or call.get("error")
+                        if result_data is not None:
+                            self._cloud_row_results[id(tree_item)] = {
+                                "status": status,
+                                "result": call.get("result"),
+                                "error": call.get("error"),
+                                "data": call.get("data"),
+                            }
+                    # 同时推送到动态捕获列表
+                    self._cloud_live_items.append(call)
+                    name = call.get("name", "")
+                    ts = call.get("timestamp", "")
+                    if not (live_kw and live_kw not in type_label.lower()
+                            and live_kw not in name.lower()):
+                        live_item = QTreeWidgetItem([type_label, name, status, str(ts)])
+                        self._cloud_live_tree.addTopLevelItem(live_item)
                 self._cloud_tree.scrollToBottom()
+                self._cloud_live_tree.scrollToBottom()
                 self._cloud_update_status()
+                self._cloud_live_update_status()
                 self._cloud_scan_lbl.setText(f"捕获中... {len(self._cloud_all_items)} 条")
                 self._cloud_scan_lbl.setStyleSheet(f"color: {c['success']};")
         elif kind == "static_results":
@@ -4082,6 +4631,22 @@ class App(QMainWindow):
                 detail = json.dumps(res, ensure_ascii=False, default=str)
                 self._cloud_result.setHtml(
                     f'<span style="color:{c["warning"]}">{name} -> {detail}</span>')
+        elif kind == "live_replay_result":
+            _, name, res = item
+            self._btn_cloud_live_replay.setEnabled(True)
+            status = res.get("status", "unknown")
+            if status == "success":
+                detail = json.dumps(res.get("result", {}), ensure_ascii=False, indent=2, default=str)
+                self._cloud_live_resp.setHtml(
+                    f'<span style="color:{c["success"]}">重放成功:\n{detail}</span>')
+            elif status == "fail":
+                err = res.get("error", "") or res.get("reason", "未知错误")
+                self._cloud_live_resp.setHtml(
+                    f'<span style="color:{c["error"]}">重放失败: {err}</span>')
+            else:
+                detail = json.dumps(res, ensure_ascii=False, indent=2, default=str)
+                self._cloud_live_resp.setHtml(
+                    f'<span style="color:{c["warning"]}">重放结果:\n{detail}</span>')
 
     def _handle_ext(self, item):
         kind = item.get("type", "")
