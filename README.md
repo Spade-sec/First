@@ -29,7 +29,7 @@
 ![11070](https://s1.galgame.fun/imgb/u55/20260601_6a1d433358324.png)
 ![11074](https://s1.galgame.fun/imgb/u55/20260601_6a1d43367a592.png)
 ### 自动更新
-![11075](https://s1.galgame.fun/imgb/u55/20260601_6a1d433635554.png)
+![3915](https://s1.galgame.fun/imgb/u55/20260601_6a1d4537482b8.png)
 
 ## 下载
 
