@@ -97,4 +97,4 @@ sudo codesign --force --deep --sign - /Applications/WeChat.app
 
 群满 200 人后需要手动邀请，请加我拉群：
 
-<img src="https://s1.galgame.fun/imgb/u55/20260622_6a389cbd40f43.jpg" alt="微信群二维码" width="300" /><img src="https://s1.galgame.fun/imgb/u55/20260601_6a1d196618084.png" alt="微信二维码" width="300" />
+<img src="https://s1.galgame.fun/imgb/u55/20260710_6a5054d733324.jpg" alt="微信群二维码" width="300" /><img src="https://s1.galgame.fun/imgb/u55/20260601_6a1d196618084.png" alt="微信二维码" width="300" />
